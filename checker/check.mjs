@@ -8,6 +8,7 @@
 //     envoie les alertes ; ce dépôt n'envoie rien.
 // Journal : compteurs seulement (pas d'identifiant de produit, pas de prix, pas d'URL).
 import { USER_AGENT, PLAYIN_ORIGIN, parseRobots, robotsAllows, detectChallenge, isPlayinProductUrl, redirectGone, readProduct } from "./playin.mjs";
+import { withRetry } from "./retry.mjs";
 
 const ORIGIN = "https://cotlyx.fr";
 const AUDIENCE = "https://cotlyx.fr/restock";
@@ -18,28 +19,40 @@ const BUDGET_MAX_MS = 240_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.log(`[restock] ${m}`);
+const retryLog = (quoi) => (k, why) => log(`${quoi} : nouvelle tentative ${k}/2 (${why})`);
 
 async function oidcToken() {
   const url = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
   const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   if (!url || !bearer) throw new Error("jeton OIDC indisponible (permission id-token: write ?)");
-  const r = await fetch(`${url}&audience=${encodeURIComponent(AUDIENCE)}`, {
-    headers: { authorization: `Bearer ${bearer}` },
-    signal: AbortSignal.timeout(10_000),
-  });
+  const r = await withRetry(
+    () => fetch(`${url}&audience=${encodeURIComponent(AUDIENCE)}`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(10_000) }),
+    { retryStatus: true, onRetry: retryLog("jeton OIDC") },
+  );
   if (!r.ok) throw new Error(`jeton OIDC : HTTP ${r.status}`);
   const j = await r.json();
   if (typeof j?.value !== "string") throw new Error("jeton OIDC illisible");
   return j.value;
 }
 
+// Appel à Cotlyx avec 2 nouvelles tentatives (délai dépassé, réseau, 5xx, 429). Le 16:35 du
+// 09/10 a échoué sur un délai dépassé ici. Un nouvel envoi des relevés est sans risque : Cotlyx
+// répond 409 « déjà rendu » s'il a reçu le premier ; après une nouvelle tentative, 409 = reçu.
 async function cotlyx(path, init = {}) {
   const token = await oidcToken();
-  return fetch(`${ORIGIN}${path}`, {
-    ...init,
-    headers: { ...(init.headers ?? {}), authorization: `Bearer ${token}`, "user-agent": CLIENT_UA, accept: "application/json" },
-    signal: AbortSignal.timeout(20_000),
-  });
+  let essais = 0;
+  const res = await withRetry(
+    () => {
+      essais += 1;
+      return fetch(`${ORIGIN}${path}`, {
+        ...init,
+        headers: { ...(init.headers ?? {}), authorization: `Bearer ${token}`, "user-agent": CLIENT_UA, accept: "application/json" },
+        signal: AbortSignal.timeout(20_000),
+      });
+    },
+    { retryStatus: true, onRetry: retryLog(path) },
+  );
+  return Object.assign(res, { essais });
 }
 
 async function main() {
@@ -70,7 +83,10 @@ async function main() {
   let groups = null;
   let stop = null;
   try {
-    const r = await fetch(`${PLAYIN_ORIGIN}/robots.txt`, { headers, redirect: "follow", signal: AbortSignal.timeout(15_000) });
+    const r = await withRetry(() => fetch(`${PLAYIN_ORIGIN}/robots.txt`, { headers, redirect: "follow", signal: AbortSignal.timeout(15_000) }), {
+      canRetry: () => Date.now() - t0 < budget,
+      onRetry: retryLog("robots.txt"),
+    });
     const txt = await r.text();
     if (detectChallenge(r.status, r.headers, txt)) stop = "defi";
     else if (!r.ok) stop = "robots";
@@ -96,8 +112,16 @@ async function main() {
     let res;
     let html = "";
     try {
-      res = await fetch(it.url, { headers, redirect: "follow", signal: AbortSignal.timeout(20_000) });
-      html = await res.text();
+      // Délai dépassé ou réseau sur une fiche : 2 nouvelles tentatives (dans le budget), puis la
+      // fiche seule est notée « reseau » ; le passage continue. Pas de nouvelle tentative sur une
+      // réponse HTTP (blocage, 4xx, 5xx) : politesse envers Play-in.
+      ({ res, html } = await withRetry(
+        async () => {
+          const r = await fetch(it.url, { headers, redirect: "follow", signal: AbortSignal.timeout(20_000) });
+          return { res: r, html: await r.text() };
+        },
+        { canRetry: () => Date.now() - t0 < budget, onRetry: retryLog("fiche") },
+      ));
     } catch {
       n.reseau += 1;
       releves.push({ id: String(it.id), erreur: "reseau" });
@@ -140,8 +164,9 @@ async function main() {
     releves,
   };
   const post = await cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  log(`bilan ${JSON.stringify({ demandees: items.length, ...n, arret: stop, duree_s: Math.round(duree / 100) / 10, envoi: post.status })}`);
-  return post.ok ? 0 : 1;
+  const recu = post.ok || (post.status === 409 && post.essais > 1);
+  log(`bilan ${JSON.stringify({ demandees: items.length, ...n, arret: stop, duree_s: Math.round(duree / 100) / 10, envoi: post.status, essais: post.essais })}`);
+  return recu ? 0 : 1;
 }
 
 main()
