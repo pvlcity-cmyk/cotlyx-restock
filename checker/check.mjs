@@ -13,7 +13,7 @@ import { withRetry } from "./retry.mjs";
 const ORIGIN = "https://cotlyx.fr";
 const AUDIENCE = "https://cotlyx.fr/restock";
 const CLIENT_UA = "CotlyxRestock/1.0 (+https://github.com/pvlcity-cmyk/cotlyx-restock)";
-const MAX_ITEMS = 30;
+const MAX_ITEMS = 40;
 const DELAY_MIN_MS = 1500;
 const BUDGET_MAX_MS = 240_000;
 
