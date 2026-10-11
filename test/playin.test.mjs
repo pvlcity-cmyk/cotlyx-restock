@@ -58,3 +58,11 @@ test("défis et redirections", () => {
   assert.equal(isPlayinProductUrl("https://evil.test/fr/produit/123/abc"), false);
   assert.equal(isPlayinProductUrl("https://www.play-in.com/fr/produit/123/abc?x=1"), false);
 });
+
+import { softGone as _softGone } from "../checker/playin.mjs";
+test("fiche absente rendue en 200 : disparue (Mini Tin 30 ans, 601563)", () => {
+  assert.equal(_softGone('<html>self.__next_f.push([1,"NEXT_HTTP_ERROR_FALLBACK;404"])</html>'), true);
+  assert.equal(_softGone('<title>X | Playin</title><span>Vous cherchiez</span> peut-être…'), true);
+  assert.equal(_softGone('<script type="application/ld+json">{"@type":"Product"}</script>Vous cherchiez'), false);
+  assert.equal(_softGone("<html>fiche normale</html>"), false);
+});

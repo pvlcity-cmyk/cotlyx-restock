@@ -7,7 +7,7 @@
 //  3. Renvoie l'état utile de chaque fiche (POST /api/restock/releves). Cotlyx décide et
 //     envoie les alertes ; ce dépôt n'envoie rien.
 // Journal : compteurs seulement (pas d'identifiant de produit, pas de prix, pas d'URL).
-import { USER_AGENT, PLAYIN_ORIGIN, parseRobots, robotsAllows, detectChallenge, isPlayinProductUrl, redirectGone, readProduct } from "./playin.mjs";
+import { USER_AGENT, PLAYIN_ORIGIN, parseRobots, robotsAllows, detectChallenge, isPlayinProductUrl, redirectGone, readProduct, softGone } from "./playin.mjs";
 import { withRetry } from "./retry.mjs";
 
 const ORIGIN = "https://cotlyx.fr";
@@ -146,6 +146,11 @@ async function main() {
       continue;
     }
     const p = readProduct(html);
+    if (!p && softGone(html)) {
+      n.disparues += 1;
+      releves.push({ id: String(it.id), disparue: true });
+      continue;
+    }
     if (!p) {
       n.jsonld += 1;
       releves.push({ id: String(it.id), erreur: "jsonld" });

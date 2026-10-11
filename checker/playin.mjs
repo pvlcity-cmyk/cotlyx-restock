@@ -227,3 +227,15 @@ export function readProduct(html) {
   const gtin = g != null && /^\d{8,14}$/.test(String(g).trim()) ? String(g).trim() : null;
   return { etat, prix, vendeur, entrepot, image: firstImage(p.image), gtin };
 }
+
+/**
+ * Fiche absente rendue en 200 (11/10 : 10 Mini Tin 30 ans, 601563) : page d'erreur Next.js
+ * (« NEXT_HTTP_ERROR_FALLBACK;404 ») ou page « Vous cherchiez peut-être… » sans produit.
+ * Aucune donnée produit dans la page (ni JSON-LD Product, ni données embarquées) : fiche
+ * disparue, pas une erreur de lecture.
+ */
+export function softGone(html) {
+  const h = String(html);
+  if (/NEXT_HTTP_ERROR_FALLBACK;404/.test(h)) return true;
+  return /Vous cherchiez/.test(h) && !/"@type\\?"\s*:\s*\\?"Product\\?"/.test(h);
+}
