@@ -15,6 +15,8 @@ concurrency:
 
 jobs:
   check:
+    # GEL 31/10 (décision Marc) : ne tourne que si la variable de dépôt RESTOCK_ENABLED vaut '1'. Voir FREEZE.md.
+    if: vars.RESTOCK_ENABLED == '1'
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
