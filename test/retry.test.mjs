@@ -53,3 +53,31 @@ test("isTransientError", () => {
   assert.equal(isTransientError(Object.assign(new Error("x"), { cause: { code: "ECONNRESET" } })), true);
   assert.equal(isTransientError(new Error("HTTP 401")), false);
 });
+
+test("pas de backoff s'il dépasse le reliquat ; éligibilité revue après l'attente", async () => {
+  let n = 0;
+  const waits = [];
+  let left = 2_500;
+  const r = await withRetry(async () => { n += 1; return { status: 503 }; }, {
+    retryStatus: true,
+    canRetry: (wait) => left >= wait + 1_000,
+    canAttempt: () => left >= 1_000,
+    sleepImpl: async (ms) => { waits.push(ms); left -= ms; },
+  });
+  assert.equal(r.status, 503);
+  assert.equal(n, 1);
+  assert.deepEqual(waits, []);
+
+  n = 0;
+  waits.length = 0;
+  left = 8_000;
+  const r2 = await withRetry(async () => { n += 1; return { status: 503 }; }, {
+    retryStatus: true,
+    canRetry: (wait) => left >= wait + 1_000,
+    canAttempt: () => false,
+    sleepImpl: async (ms) => { waits.push(ms); left -= ms; },
+  });
+  assert.equal(r2.status, 503);
+  assert.equal(n, 1, "pas de nouvelle tentative une fois canAttempt faux après le backoff");
+  assert.deepEqual(waits, [2000]);
+});
