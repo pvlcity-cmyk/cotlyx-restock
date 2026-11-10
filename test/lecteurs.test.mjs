@@ -22,6 +22,8 @@ import {
 } from "../checker/dispatch.mjs";
 import { readProduct, detectChallenge } from "../checker/playin.mjs";
 import { lotPath, LOT_SHOPS_QUERY, runPassage, délaisDuLot, budgetDuLot } from "../checker/passage.mjs";
+import { createCotlyx, jwtExpMs } from "../checker/cotlyx.mjs";
+import { BUDGET_MAX_MS, OIDC_DUREE_DEFAUT_MS, POST_TIMEOUT_MS, GET_LOT_TIMEOUT_MS } from "../checker/budget.mjs";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const fx = (name) => readFileSync(join(dir, "fixtures", name), "utf8");
@@ -548,4 +550,267 @@ test("redirection : seulement vers un hôte autorisé de l'enseigne, au plus 3 s
   const pages = hopFetch.calls.filter((c) => !c.url.endsWith("/robots.txt"));
   assert.ok(pages.length <= MAX_REDIRECTS + 1, "au plus 3 sauts (4 requêtes)");
   assert.ok(!pages.some((c) => c.url.endsWith("/s5")), "le 4e saut n'est pas suivi");
+});
+
+/* ---------- échéance absolue : repros Data (tête 9a0ba4bf) ---------- */
+
+function fakeJwt(expMs) {
+  const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ exp: Math.floor(expMs / 1000) })).toString("base64url");
+  return `${header}.${payload}.sig`;
+}
+
+function horloge(t0 = 0) {
+  let t = t0;
+  const sleeps = [];
+  return {
+    get t() {
+      return t;
+    },
+    set t(v) {
+      t = v;
+    },
+    now: () => t,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      t += ms;
+    },
+    sleeps,
+    advance: (ms) => {
+      t += ms;
+    },
+  };
+}
+
+test("jwt OIDC : exp lu, durée typique 5 min (supérieure au budget de 240 s)", () => {
+  assert.equal(jwtExpMs("pas-un-jwt"), null);
+  assert.equal(jwtExpMs(fakeJwt(300_000)), 300_000);
+  assert.equal(OIDC_DUREE_DEFAUT_MS, 300_000);
+  assert.ok(OIDC_DUREE_DEFAUT_MS > BUDGET_MAX_MS);
+});
+
+test("restitution à 230000 ms avec OIDC 9 s et POST 9 s : fin ≤ 240000 (cas Data)", async () => {
+  // Repro Data : à 230000, oidcToken (jusqu'à 3 × 10 s) puis POST 9 s → fin 248000,
+  // sans échéance passée à postReleves. Ici le jeton est obtenu avant la lecture
+  // (valable 5 min) ; à 230000 il ne reste que le POST de 9 s → 239000.
+  const BUDGET = BUDGET_MAX_MS;
+  const clk = horloge(0);
+  const calls = [];
+  const timeouts = [];
+  const jwt = fakeJwt(clk.now() + OIDC_DUREE_DEFAUT_MS);
+  const env = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.test/token?r=1",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-token",
+  };
+  let lastTimeout = Infinity;
+  const timeoutFn = (ms) => {
+    lastTimeout = ms;
+    timeouts.push({ ms, at: clk.now() });
+    return new AbortController().signal;
+  };
+  const fetchImpl = async (input) => {
+    const url = String(input);
+    calls.push({ url, at: clk.now() });
+    const spend = Math.min(9_000, lastTimeout);
+    if (url.startsWith("https://oidc.test/")) {
+      clk.advance(spend);
+      if (spend < 9_000) throw Object.assign(new Error("échéance"), { name: "TimeoutError" });
+      return Response.json({ value: jwt });
+    }
+    if (url.includes("/api/restock/lot")) {
+      return Response.json({
+        ok: true,
+        lot: "lot-restit-12345678",
+        delayMs: 3000,
+        budgetMs: BUDGET,
+        items: [{ id: "33282", url: URLS.ultrajeux, shop: "ultrajeux" }],
+      });
+    }
+    if (url.includes("/api/restock/releves")) {
+      clk.advance(spend);
+      if (spend < 9_000) throw Object.assign(new Error("échéance"), { name: "TimeoutError" });
+      return new Response("{}", { status: 200 });
+    }
+    throw new Error(`réseau enseigne interdit dans ce test : ${url}`);
+  };
+  const client = createCotlyx({
+    fetchImpl,
+    now: clk.now,
+    sleep: clk.sleep,
+    timeoutFn,
+    env,
+    getDeadline: () => BUDGET,
+  });
+  await client.oidcToken();
+  assert.equal(clk.t, 9_000);
+  clk.t = 230_000;
+  const code = await runPassage({
+    t0: 0,
+    now: clk.now,
+    sleep: clk.sleep,
+    deadline: BUDGET,
+    prefetchOidc: () => client.oidcToken(),
+    getLot: (path) => client.cotlyx(path, {}, GET_LOT_TIMEOUT_MS),
+    postReleves: (body) =>
+      client.cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, POST_TIMEOUT_MS),
+    fetchImpl,
+  });
+  assert.equal(code, 0);
+  assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+  assert.equal(clk.t, 239_000);
+  const oidc = calls.filter((c) => c.url.startsWith("https://oidc.test/"));
+  const posts = calls.filter((c) => c.url.includes("/releves"));
+  assert.equal(oidc.length, 1);
+  assert.equal(oidc[0].at, 0);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].at, 230_000);
+  assert.ok(!calls.some((c) => c.at >= BUDGET), "aucun appel à l'échéance ou après");
+  const postTimeout = timeouts.filter((x) => x.at === 230_000);
+  assert.ok(postTimeout.some((x) => x.ms <= 10_000));
+});
+
+test("restitution : 503 suivi de retries bornés à l'échéance (cas Data)", async () => {
+  // Repro Data : 503 + backoffs 2 s et 5 s + retries POST 10 s → fin 273000.
+  // Jeton déjà obtenu ; POST 503 en 9 s à 230000 ; un backoff de 2 s dépasserait 240000.
+  const BUDGET = BUDGET_MAX_MS;
+  const clk = horloge(0);
+  const calls = [];
+  const jwt = fakeJwt(OIDC_DUREE_DEFAUT_MS);
+  const env = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.test/token?r=1",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-token",
+  };
+  let lastTimeout = Infinity;
+  const timeoutFn = (ms) => {
+    lastTimeout = ms;
+    return new AbortController().signal;
+  };
+  const fetchImpl = async (input) => {
+    const url = String(input);
+    calls.push({ url, at: clk.now() });
+    if (url.startsWith("https://oidc.test/")) {
+      clk.advance(Math.min(9_000, lastTimeout));
+      return Response.json({ value: jwt });
+    }
+    if (url.includes("/api/restock/lot")) {
+      return Response.json({
+        ok: true,
+        lot: "lot-503-12345678",
+        delayMs: 3000,
+        budgetMs: BUDGET,
+        items: [{ id: "33282", url: URLS.ultrajeux, shop: "ultrajeux" }],
+      });
+    }
+    if (url.includes("/api/restock/releves")) {
+      clk.advance(Math.min(9_000, lastTimeout));
+      return new Response("{}", { status: 503 });
+    }
+    throw new Error(`réseau enseigne interdit dans ce test : ${url}`);
+  };
+  const client = createCotlyx({
+    fetchImpl,
+    now: clk.now,
+    sleep: clk.sleep,
+    timeoutFn,
+    env,
+    getDeadline: () => BUDGET,
+  });
+  await client.oidcToken();
+  clk.t = 230_000;
+  const code = await runPassage({
+    t0: 0,
+    now: clk.now,
+    sleep: clk.sleep,
+    deadline: BUDGET,
+    prefetchOidc: () => client.oidcToken(),
+    getLot: (path) => client.cotlyx(path, {}, GET_LOT_TIMEOUT_MS),
+    postReleves: (body) =>
+      client.cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, POST_TIMEOUT_MS),
+    fetchImpl,
+  });
+  assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+  assert.equal(clk.t, 239_000);
+  const posts = calls.filter((c) => c.url.includes("/releves"));
+  assert.equal(posts.length, 1, "pas de retry POST une fois le backoff trop long");
+  assert.ok(!calls.some((c) => c.at >= BUDGET));
+  assert.equal(code, 1);
+});
+
+test("page : pas d'appel à 229500 ms ni après l'échéance (cas Data)", async () => {
+  // Repro Data : départ 223500, robots immédiat, sommeil 4000, page à 227500
+  // (TimeoutError immédiat), backoff 2000, nouvelle page à 229500 avec timeout 500 ms.
+  const BUDGET = BUDGET_MAX_MS;
+  const clk = horloge(223_500);
+  const calls = [];
+  const timeouts = [];
+  const timeoutFn = (ms) => {
+    timeouts.push({ ms, at: clk.now() });
+    return new AbortController().signal;
+  };
+  const fetchImpl = async (input) => {
+    const url = String(input);
+    calls.push({ url, at: clk.now() });
+    if (url.endsWith("/robots.txt")) return new Response("User-agent: *\nAllow: /\n");
+    throw Object.assign(new Error("délai dépassé"), { name: "TimeoutError" });
+  };
+  const r = await lireLot([{ id: "33282", url: URLS.ultrajeux, shop: "ultrajeux" }], {
+    fetchImpl,
+    sleep: clk.sleep,
+    now: clk.now,
+    t0: 0,
+    deadline: BUDGET,
+    budgetMs: BUDGET,
+    delayPlayinMs: 3000,
+    timeoutFn,
+  });
+  assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+  assert.ok(!calls.some((c) => c.at >= BUDGET), "aucun appel à l'échéance ou après");
+  assert.ok(!calls.some((c) => c.at === 229_500), "pas de page à 229500 ms");
+  const pages = calls.filter((c) => !c.url.endsWith("/robots.txt"));
+  assert.equal(pages.length, 0, "pas de fiche une fois le reliquat < politesse + 1 s");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].at, 223_500);
+  assert.ok(calls[0].url.endsWith("/robots.txt"));
+  assert.equal(r.releves.length, 0, "item non traité, non consommé dans les relevés");
+});
+
+test("cadence par enseigne : retries compris, 4 s hors Play-In et 3 s Play-In (cas Data 2 s)", async () => {
+  // Repro Data : 2 s seulement entre deux requêtes de la même enseigne (backoff retry).
+  const BUDGET = BUDGET_MAX_MS;
+  const cadence = async (shop, url, delay, body) => {
+    const clk = horloge(0);
+    const calls = [];
+    let pages = 0;
+    const timeoutFn = (ms) => new AbortController().signal;
+    const fetchImpl = async (input) => {
+      const u = String(input);
+      calls.push({ url: u, at: clk.now() });
+      if (u.endsWith("/robots.txt")) return new Response("User-agent: *\nAllow: /\n");
+      pages += 1;
+      if (pages === 1) throw Object.assign(new Error("délai dépassé"), { name: "TimeoutError" });
+      return new Response(body, { status: 200 });
+    };
+    await lireLot([{ id: shop === "playin" ? "123456" : "33282", url, shop }], {
+      fetchImpl,
+      sleep: clk.sleep,
+      now: clk.now,
+      t0: 0,
+      deadline: BUDGET,
+      budgetMs: BUDGET,
+      delayPlayinMs: 3000,
+      timeoutFn,
+    });
+    assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+    assert.ok(!calls.some((c) => c.at >= BUDGET));
+    assert.ok(calls.length >= 3, "robots + page + retry");
+    for (let i = 1; i < calls.length; i++) {
+      const gap = calls[i].at - calls[i - 1].at;
+      assert.ok(gap >= delay, `écart ${gap} ms < ${delay} ms (${shop})`);
+    }
+    const fiches = calls.filter((c) => !c.url.endsWith("/robots.txt"));
+    assert.ok(fiches.length >= 2, "le retry a bien eu lieu, à la cadence");
+    return { calls, t: clk.t };
+  };
+  await cadence("ultrajeux", URLS.ultrajeux, 4_000, UJ_IN);
+  await cadence("playin", URLS.playin, 3_000, playinPage());
 });

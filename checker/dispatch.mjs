@@ -21,9 +21,11 @@ import { ULTRAJEUX_ORIGIN, isUltrajeuxProductUrl, readUltrajeux } from "./ultraj
 import { JSONLD_SHOPS, isJsonLdShopProductUrl, readJsonLdShop } from "./jsonld-shop.mjs";
 import { buildReleve } from "./releve.mjs";
 import { PUBLIC_LOT_SHOPS } from "./shops.mjs";
+import { POST_RESERVE_MS, FETCH_MARGIN_MS, reliquatJusqua } from "./budget.mjs";
 
 export { buildReleve, buildRelevesBody } from "./releve.mjs";
 export { PUBLIC_LOT_SHOPS } from "./shops.mjs";
+export { POST_RESERVE_MS, FETCH_MARGIN_MS } from "./budget.mjs";
 
 /** Délai plancher entre deux fiches d'une même enseigne hors Play-In (4 s, ticket). */
 export const SHOP_DELAY_MS = 4000;
@@ -36,10 +38,6 @@ export const SHOP_ORIGINS = {
   ...Object.fromEntries(Object.entries(JSONLD_SHOPS).map(([k, v]) => [k, v.origin])),
 };
 
-/** Réserve pour le POST /releves, retirée du budget dès le départ. */
-export const POST_RESERVE_MS = 10_000;
-/** Temps minimum pour lancer un appel réseau (timeout borné au reliquat). */
-export const FETCH_MARGIN_MS = 1_000;
 export const MAX_REDIRECTS = 3;
 export const ROBOTS_TIMEOUT_MS = 15_000;
 export const PAGE_TIMEOUT_MS = 20_000;
@@ -206,20 +204,18 @@ function groupByShop(items) {
   return { map, order };
 }
 
-/**
- * Lit les fiches du lot, enseigne par enseigne.
- * Un défi n'arrête que cette enseigne. Play-In d'abord, même délai et mêmes règles qu'aujourd'hui.
- */
 export function reliquatLecture(nowMs, t0, budgetMs, reserveMs = POST_RESERVE_MS) {
-  return Math.max(0, budgetMs - reserveMs - (nowMs - t0));
+  return reliquatJusqua(nowMs, t0 + budgetMs - reserveMs);
 }
 
 /**
  * Lit les fiches du lot, enseigne par enseigne.
  * Un défi n'arrête que cette enseigne. Play-In d'abord, même délai et mêmes règles qu'aujourd'hui.
- * Le budget inclut une réserve pour le POST des relevés : plus aucun réseau (robots, page, retry)
- * une fois le reliquat à 0, ou s'il est inférieur au délai de politesse plus une marge.
- * Sleep et timeouts sont bornés au reliquat. Les items non traités ne sont pas renvoyés.
+ * Échéance absolue : deadline (t0 + budget). La lecture s'arrête plus tôt d'une réserve POST.
+ * Cadence par enseigne (retries compris) : au moins `delay` depuis le départ de la
+ * requête précédente. Éligibilité revue au départ effectif, après le backoff :
+ * reliquat ≥ délai de politesse + 1 s, et timeout minimal utile (FETCH_MARGIN_MS).
+ * Les items non traités ne sont pas renvoyés.
  */
 export async function lireLot(items, opts = {}) {
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -228,6 +224,8 @@ export async function lireLot(items, opts = {}) {
   const t0 = opts.t0 ?? now();
   const budget = opts.budgetMs ?? 200_000;
   const reserve = opts.reserveMs ?? POST_RESERVE_MS;
+  const deadline = opts.deadline ?? t0 + budget;
+  const lectureDeadline = deadline - reserve;
   const timeoutFn = opts.timeoutFn ?? ((ms) => AbortSignal.timeout(ms));
   const delayPlayin = opts.delayPlayinMs ?? 3000;
   const delayShop = Math.max(SHOP_DELAY_MS, opts.delayShopMs ?? opts.delayPlayinMs ?? SHOP_DELAY_MS);
@@ -238,21 +236,38 @@ export async function lireLot(items, opts = {}) {
   const releves = [];
   const arrets = {};
   let playinStop = null;
+  const lastStart = new Map();
   const headers = { "user-agent": USER_AGENT, "accept-language": "fr-FR,fr;q=0.9", accept: "text/html,application/xhtml+xml" };
 
-  const reliquat = () => reliquatLecture(now(), t0, budget, reserve);
+  const reliquat = () => reliquatJusqua(now(), lectureDeadline);
+  const reliquatTotal = () => reliquatJusqua(now(), deadline);
   const peutReseau = (besoin = FETCH_MARGIN_MS) => reliquat() >= besoin;
   const peutLireFiche = (delay) => reliquat() >= delay + FETCH_MARGIN_MS;
   const signalBorne = (maxMs) => {
-    const ms = Math.min(maxMs, reliquat());
-    if (ms <= 0) return null;
-    return timeoutFn(ms);
+    const left = reliquat();
+    if (left < FETCH_MARGIN_MS) return null;
+    return timeoutFn(Math.min(maxMs, left));
   };
-  const sleepBorne = async (ms) => {
-    const cap = reliquat();
-    if (cap <= 0 || ms <= 0) return;
-    await sleep(Math.min(ms, cap));
-  };
+
+  /** Attend la cadence depuis le départ de la requête précédente. Pas d'attente partielle. */
+  async function attendreCadence(shop, delay) {
+    const prev = lastStart.get(shop);
+    if (prev == null) return true;
+    const wait = prev + delay - now();
+    if (wait <= 0) return true;
+    if (now() + wait > deadline) return false;
+    // Après l'attente, il doit rester de quoi partir : politesse + 1 s (et la marge réseau).
+    if (now() + wait + delay + FETCH_MARGIN_MS > lectureDeadline) return false;
+    await sleep(wait);
+    return reliquatTotal() > 0 && peutLireFiche(delay);
+  }
+
+  function backoffCadence(shop, delay, i) {
+    const standard = i === 0 ? 2000 : 5000;
+    const prev = lastStart.get(shop);
+    const waitCadence = prev == null ? 0 : Math.max(0, prev + delay - now());
+    return Math.max(standard, waitCadence);
+  }
 
   const { map, order } = groupByShop(items);
 
@@ -263,20 +278,37 @@ export async function lireLot(items, opts = {}) {
     let groups = null;
     let stop = null;
 
-    // Il faut de quoi lire au moins une fiche après un robots.txt rapide.
     if (!peutLireFiche(delay) || !peutReseau()) {
       n.temps += group.length;
       continue;
     }
 
+    const canRetryApres = (wait = 0) => {
+      if (wait < 0) wait = 0;
+      if (now() + wait > deadline) return false;
+      if (now() + wait + FETCH_MARGIN_MS > lectureDeadline) return false;
+      // Après le backoff, il faudra encore reliquat ≥ politesse + 1 s.
+      return lectureDeadline - (now() + wait) >= delay + FETCH_MARGIN_MS;
+    };
+    const canAttemptShop = () => peutLireFiche(delay) && peutReseau() && reliquatTotal() > 0;
+
     try {
       const got = await withRetry(
-        () => {
+        async () => {
+          if (!(await attendreCadence(shop, delay))) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+          if (!canAttemptShop()) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
           const signal = signalBorne(ROBOTS_TIMEOUT_MS);
           if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+          lastStart.set(shop, now());
           return fetchManuel(fetchImpl, `${origin}/robots.txt`, { headers, signal, shop });
         },
-        { canRetry: () => peutReseau(), sleepImpl: sleepBorne, onRetry: retryLog("robots.txt") },
+        {
+          backoffMs: (i) => backoffCadence(shop, delay, i),
+          canRetry: canRetryApres,
+          canAttempt: canAttemptShop,
+          sleepImpl: sleep,
+          onRetry: retryLog("robots.txt"),
+        },
       );
       if (got?.interdit) {
         stop = "robots";
@@ -293,8 +325,6 @@ export async function lireLot(items, opts = {}) {
     }
 
     if (stop) {
-      // `arrets` n'accepte que defi | 503. Un échec robots n'y figure pas
-      // (Play-In : champ historique `arret` seulement).
       if (stop === "defi" || stop === "503") {
         arrets[shop] = stop;
         n.defi += 1;
@@ -314,8 +344,11 @@ export async function lireLot(items, opts = {}) {
         releves.push(buildReleve(it, { erreur: "robots" }));
         continue;
       }
-      await sleepBorne(delay);
-      if (!peutReseau()) {
+      if (!(await attendreCadence(shop, delay))) {
+        n.temps += 1;
+        continue;
+      }
+      if (!peutLireFiche(delay) || !peutReseau()) {
         n.temps += 1;
         continue;
       }
@@ -325,13 +358,22 @@ export async function lireLot(items, opts = {}) {
       try {
         ({ res, html } = await withRetry(
           async () => {
+            if (!(await attendreCadence(shop, delay))) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+            if (!canAttemptShop()) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
             const signal = signalBorne(PAGE_TIMEOUT_MS);
             if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+            lastStart.set(shop, now());
             const got = await fetchManuel(fetchImpl, it.url, { headers, signal, shop });
             if (got?.interdit) return { res: null, html: "", interdit: true };
             return { res: got, html: await got.text() };
           },
-          { canRetry: () => peutReseau(), sleepImpl: sleepBorne, onRetry: retryLog("fiche") },
+          {
+            backoffMs: (i) => backoffCadence(shop, delay, i),
+            canRetry: canRetryApres,
+            canAttempt: canAttemptShop,
+            sleepImpl: sleep,
+            onRetry: retryLog("fiche"),
+          },
         ));
         if (res == null) {
           n.http += 1;

@@ -1,6 +1,8 @@
 // Nouvelles tentatives (09/10) : un délai dépassé ou une coupure réseau ne doit pas faire
 // échouer tout le passage. 2 nouvelles tentatives, attente croissante (2 s puis 5 s).
 // Jamais de nouvelle tentative sur un refus (4xx) ni sur un signe de blocage.
+// L'éligibilité est revue avant le backoff ET après (canAttempt), au moment où la
+// requête suivante part vraiment. Pas de backoff s'il dépasse le reliquat (canRetry(wait)).
 
 export const RETRY_BACKOFF_MS = [2000, 5000];
 
@@ -20,23 +22,31 @@ export const isTransientStatus = (status) => status === 429 || status >= 500;
 
 /**
  * Appelle `fn(tentative)` jusqu'à 3 fois. `retryStatus` : retente aussi une réponse 5xx / 429.
- * `canRetry()` : faux → on s'arrête (budget de temps). Renvoie la dernière réponse, ou relance
- * la dernière erreur.
+ * `canRetry(waitMs)` : faux → on n'attend pas et on ne retente pas (backoff trop long, budget).
+ * `canAttempt()` : revérifié APRÈS le backoff, avant la tentative suivante.
+ * `backoffMs` : tableau, ou fonction `(i) => ms`.
  */
-export async function withRetry(fn, { retries = 2, backoffMs = RETRY_BACKOFF_MS, retryStatus = false, canRetry = () => true, sleepImpl = sleep, onRetry } = {}) {
+export async function withRetry(fn, { retries = 2, backoffMs = RETRY_BACKOFF_MS, retryStatus = false, canRetry = () => true, canAttempt = () => true, sleepImpl = sleep, onRetry } = {}) {
+  const waitOf = (i) => (typeof backoffMs === "function" ? backoffMs(i) : backoffMs[Math.min(i, backoffMs.length - 1)]);
   for (let i = 0; ; i++) {
     try {
       const res = await fn(i);
-      if (retryStatus && res && isTransientStatus(res.status) && i < retries && canRetry()) {
+      if (retryStatus && res && isTransientStatus(res.status) && i < retries) {
+        const wait = Math.max(0, waitOf(i));
+        if (!canRetry(wait)) return res;
         onRetry?.(i + 1, `HTTP ${res.status}`);
-        await sleepImpl(backoffMs[Math.min(i, backoffMs.length - 1)]);
+        await sleepImpl(wait);
+        if (!canAttempt()) return res;
         continue;
       }
       return res;
     } catch (err) {
-      if (!isTransientError(err) || i >= retries || !canRetry()) throw err;
+      if (!isTransientError(err) || i >= retries) throw err;
+      const wait = Math.max(0, waitOf(i));
+      if (!canRetry(wait)) throw err;
       onRetry?.(i + 1, err?.name === "TimeoutError" ? "délai dépassé" : "réseau");
-      await sleepImpl(backoffMs[Math.min(i, backoffMs.length - 1)]);
+      await sleepImpl(wait);
+      if (!canAttempt()) throw err;
     }
   }
 }
