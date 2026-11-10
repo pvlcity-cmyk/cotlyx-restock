@@ -16,6 +16,9 @@ import {
   SHOP_DELAY_MS,
   PUBLIC_LOT_SHOPS,
   idChaine,
+  POST_RESERVE_MS,
+  MAX_REDIRECTS,
+  urlHoteAutorise,
 } from "../checker/dispatch.mjs";
 import { readProduct, detectChallenge } from "../checker/playin.mjs";
 import { lotPath, LOT_SHOPS_QUERY, runPassage, délaisDuLot, budgetDuLot } from "../checker/passage.mjs";
@@ -66,7 +69,7 @@ function fakeFetch(pages, { robots = ROBOTS_OK, statusOf = {}, headersOf = {} } 
   const fetchImpl = async (input, init) => {
     const url = String(input);
     const ua = new Headers(init?.headers).get("user-agent") ?? new Headers(init?.headers).get("User-Agent");
-    calls.push({ url, ua, headers: init?.headers ?? {} });
+    calls.push({ url, ua, headers: init?.headers ?? {}, redirect: init?.redirect });
     if (url.endsWith("/robots.txt")) {
       const body = typeof robots === "function" ? robots(url) : robots;
       const status = statusOf[url] ?? 200;
@@ -74,13 +77,11 @@ function fakeFetch(pages, { robots = ROBOTS_OK, statusOf = {}, headersOf = {} } 
     }
     const p = pages[url];
     if (!p) return new Response("absent", { status: 404 });
-    const status = p.status ?? statusOf[url] ?? 200;
-    const r = new Response(p.body ?? "", { status, headers: p.headers ?? headersOf[url] });
     if (p.redirectTo) {
-      Object.defineProperty(r, "redirected", { value: true });
-      Object.defineProperty(r, "url", { value: p.redirectTo });
+      return new Response("", { status: p.status ?? 302, headers: { location: p.redirectTo, ...(p.headers ?? headersOf[url] ?? {}) } });
     }
-    return r;
+    const status = p.status ?? statusOf[url] ?? 200;
+    return new Response(p.body ?? "", { status, headers: p.headers ?? headersOf[url] });
   };
   return { fetchImpl, calls };
 }
@@ -441,4 +442,110 @@ test("delayMs et budgetMs respectés, sans descendre sous 3 à 4 s", () => {
   assert.equal(budgetDuLot({ budgetMs: 10_000 }), 10_000);
   assert.equal(budgetDuLot({}), 200_000);
   assert.equal(budgetDuLot({ budgetMs: 999_999 }), 240_000);
+});
+
+
+/* ---------- budget 240 s et redirections manuelles ---------- */
+
+test("budget 240 s tenu (cas Data) : aucun réseau après expiration, POST inclus", async () => {
+  // Repro Data : budget=240000, horloge=240001, robots UJ à 240001 puis BCD à 255001, fin à 270001
+  // (timeouts 15 s non bornés, robots des enseignes suivantes après expiration).
+  // Avec réserve POST 10 s, la lecture s'arrête à 230000 ; on part de là.
+  const BUDGET = 240_000;
+  let t = BUDGET - POST_RESERVE_MS;
+  const calls = [];
+  const now = () => t;
+  const sleep = async (ms) => {
+    t += ms;
+  };
+  const fetchImpl = async (input) => {
+    const url = String(input);
+    calls.push({ url, at: t });
+    // Sans borne, un robots.txt qui expire au timeout ferait +15 s (repro Data).
+    t += 15_000;
+    return new Response("User-agent: *\nAllow: /\n");
+  };
+  const posts = [];
+  const code = await runPassage({
+    t0: 0,
+    now,
+    sleep,
+    getLot: async () =>
+      Response.json({
+        ok: true,
+        lot: "lot-budget-12345678",
+        delayMs: 3000,
+        budgetMs: BUDGET,
+        items: [
+          { id: "123456", url: URLS.playin, shop: "playin" },
+          { id: "33282", url: URLS.ultrajeux, shop: "ultrajeux" },
+          { id: "39598", url: URLS.bcd, shop: "bcd" },
+        ],
+      }),
+    postReleves: async (body) => {
+      posts.push(body);
+      t += 9_000;
+      return Object.assign(new Response("{}", { status: 200 }), { essais: 1 });
+    },
+    fetchImpl,
+  });
+  assert.equal(code, 0);
+  assert.ok(t <= BUDGET, `fin à ${t} ms, budget ${BUDGET}`);
+  assert.equal(POST_RESERVE_MS, 10_000);
+  assert.equal(posts.length, 1);
+  assert.equal(calls.length, 0, "aucun appel réseau une fois le reliquat de lecture épuisé");
+  assert.ok(!calls.some((c) => c.url.includes("ultrajeux") || c.url.includes("bcd-jeux")));
+  const ids = (posts[0].releves ?? []).map((r) => r.id);
+  assert.ok(!ids.includes("33282"));
+  assert.ok(!ids.includes("39598"));
+  assert.ok(!ids.includes("123456"));
+});
+
+test("redirection : seulement vers un hôte autorisé de l'enseigne, au plus 3 sauts", async () => {
+  assert.equal(urlHoteAutorise("ultrajeux", "https://www.ultrajeux.com/categorie/x"), true);
+  assert.equal(urlHoteAutorise("ultrajeux", "https://evil.test/x"), false);
+  assert.equal(urlHoteAutorise("ultrajeux", "http://www.ultrajeux.com/x"), false);
+
+  const clk = clock();
+  const { fetchImpl, calls } = fakeFetch({
+    [URLS.ultrajeux]: { redirectTo: "https://evil.test/phish" },
+    "https://evil.test/phish": { body: UJ_IN },
+    [URLS.bcd]: { redirectTo: "https://www.bcd-jeux.fr/categorie/pokemon/" },
+    "https://www.bcd-jeux.fr/categorie/pokemon/": { body: "<html>catégorie</html>" },
+  });
+  const r = await lireLot(
+    [
+      { id: "33282", url: URLS.ultrajeux, shop: "ultrajeux" },
+      { id: "39598", url: URLS.bcd, shop: "bcd" },
+    ],
+    { fetchImpl, sleep: clk.sleep, now: clk.now, t0: clk.now(), delayPlayinMs: 3000, budgetMs: 120_000 },
+  );
+  const byId = Object.fromEntries(r.releves.map((x) => [x.id, x]));
+  assert.equal(byId["33282"].erreur, "http_autre");
+  assert.ok(!calls.some((c) => c.url.includes("evil.test")), "aucune requête vers un hôte hors liste");
+  assert.equal(byId["39598"].disparue, true);
+  assert.ok(calls.every((c) => c.redirect === "manual"));
+
+  const a = "https://www.ultrajeux.com/produit-1-a.html";
+  const hops = {
+    [a]: { redirectTo: "https://www.ultrajeux.com/s2" },
+    "https://www.ultrajeux.com/s2": { redirectTo: "https://www.ultrajeux.com/s3" },
+    "https://www.ultrajeux.com/s3": { redirectTo: "https://www.ultrajeux.com/s4" },
+    "https://www.ultrajeux.com/s4": { redirectTo: "https://www.ultrajeux.com/s5" },
+    "https://www.ultrajeux.com/s5": { body: UJ_IN },
+  };
+  const hopFetch = fakeFetch(hops);
+  const clk2 = clock();
+  const r2 = await lireLot([{ id: "1", url: a, shop: "ultrajeux" }], {
+    fetchImpl: hopFetch.fetchImpl,
+    sleep: clk2.sleep,
+    now: clk2.now,
+    t0: clk2.now(),
+    delayPlayinMs: 3000,
+    budgetMs: 120_000,
+  });
+  assert.equal(r2.releves[0].erreur, "http_autre");
+  const pages = hopFetch.calls.filter((c) => !c.url.endsWith("/robots.txt"));
+  assert.ok(pages.length <= MAX_REDIRECTS + 1, "au plus 3 sauts (4 requêtes)");
+  assert.ok(!pages.some((c) => c.url.endsWith("/s5")), "le 4e saut n'est pas suivi");
 });

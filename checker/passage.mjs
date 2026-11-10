@@ -2,10 +2,10 @@
 // GET /api/restock/lot?shops=… — 204 sans corps : sortie propre, aucun POST.
 // POST /api/restock/releves — voir checker/releve.mjs.
 import { PUBLIC_LOT_SHOPS } from "./shops.mjs";
-import { preparerItems, lireLot, SHOP_DELAY_MS } from "./dispatch.mjs";
+import { preparerItems, lireLot, SHOP_DELAY_MS, POST_RESERVE_MS } from "./dispatch.mjs";
 import { buildRelevesBody } from "./releve.mjs";
 
-export { PUBLIC_LOT_SHOPS };
+export { PUBLIC_LOT_SHOPS, POST_RESERVE_MS };
 
 /** Query `shops=` : liste blanche du contrat, dans cet ordre. Le serveur en fait l'intersection. */
 export const LOT_SHOPS_QUERY = PUBLIC_LOT_SHOPS.join(",");

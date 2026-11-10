@@ -36,6 +36,75 @@ export const SHOP_ORIGINS = {
   ...Object.fromEntries(Object.entries(JSONLD_SHOPS).map(([k, v]) => [k, v.origin])),
 };
 
+/** Réserve pour le POST /releves, retirée du budget dès le départ. */
+export const POST_RESERVE_MS = 10_000;
+/** Temps minimum pour lancer un appel réseau (timeout borné au reliquat). */
+export const FETCH_MARGIN_MS = 1_000;
+export const MAX_REDIRECTS = 3;
+export const ROBOTS_TIMEOUT_MS = 15_000;
+export const PAGE_TIMEOUT_MS = 20_000;
+
+/** Hôtes autorisés par enseigne : l'hôte de l'origine, plus d'éventuels alias www/apex. */
+export const SHOP_HOSTS = {
+  playin: ["www.play-in.com", "play-in.com"],
+  ultrajeux: ["www.ultrajeux.com", "ultrajeux.com"],
+  smartoys: ["www.smartoys.be", "smartoys.be"],
+  bcd: ["www.bcd-jeux.fr", "bcd-jeux.fr"],
+  pokemael: ["pokemael.com", "www.pokemael.com"],
+  tzp: ["www.tzp.fr", "tzp.fr"],
+  gentlemen: ["lesgentlemendujeu.com", "www.lesgentlemendujeu.com"],
+};
+
+export function hostsAutorises(shop) {
+  return new Set(SHOP_HOSTS[shop] ?? []);
+}
+
+/** URL https dont l'hôte est dans la liste de l'enseigne. */
+export function urlHoteAutorise(shop, url) {
+  try {
+    const u = typeof url === "string" ? new URL(url) : url;
+    return u.protocol === "https:" && hostsAutorises(shop).has(u.host);
+  } catch {
+    return false;
+  }
+}
+
+function estRedirection(status) {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function finaliserReponse(res, url, redirected) {
+  Object.defineProperty(res, "url", { value: url, configurable: true });
+  Object.defineProperty(res, "redirected", { value: redirected, configurable: true });
+  return res;
+}
+
+/**
+ * GET avec redirect:manual. On ne suit une redirection que si l'hôte d'arrivée
+ * est autorisé pour l'enseigne, https, au plus MAX_REDIRECTS sauts.
+ * Sinon { interdit: true } → relevé http_autre (page) ou échec robots.
+ */
+export async function fetchManuel(fetchImpl, url, { headers, signal, shop }) {
+  let current = url;
+  let redirected = false;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const res = await fetchImpl(current, { headers, redirect: "manual", signal });
+    if (!estRedirection(res.status)) return finaliserReponse(res, current, redirected);
+    const loc = res.headers.get("location");
+    if (!loc || hop === MAX_REDIRECTS) return { interdit: true };
+    let next;
+    try {
+      next = new URL(loc, current);
+    } catch {
+      return { interdit: true };
+    }
+    if (!urlHoteAutorise(shop, next)) return { interdit: true };
+    redirected = true;
+    current = next.href;
+  }
+  return { interdit: true };
+}
+
 const JSONLD_NAMES = new Set(Object.keys(JSONLD_SHOPS));
 
 export function isKnownShop(shop) {
@@ -141,12 +210,25 @@ function groupByShop(items) {
  * Lit les fiches du lot, enseigne par enseigne.
  * Un défi n'arrête que cette enseigne. Play-In d'abord, même délai et mêmes règles qu'aujourd'hui.
  */
+export function reliquatLecture(nowMs, t0, budgetMs, reserveMs = POST_RESERVE_MS) {
+  return Math.max(0, budgetMs - reserveMs - (nowMs - t0));
+}
+
+/**
+ * Lit les fiches du lot, enseigne par enseigne.
+ * Un défi n'arrête que cette enseigne. Play-In d'abord, même délai et mêmes règles qu'aujourd'hui.
+ * Le budget inclut une réserve pour le POST des relevés : plus aucun réseau (robots, page, retry)
+ * une fois le reliquat à 0, ou s'il est inférieur au délai de politesse plus une marge.
+ * Sleep et timeouts sont bornés au reliquat. Les items non traités ne sont pas renvoyés.
+ */
 export async function lireLot(items, opts = {}) {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const sleep = opts.sleep ?? defaultSleep;
   const now = opts.now ?? Date.now;
   const t0 = opts.t0 ?? now();
-  const budget = opts.budgetMs ?? 150_000;
+  const budget = opts.budgetMs ?? 200_000;
+  const reserve = opts.reserveMs ?? POST_RESERVE_MS;
+  const timeoutFn = opts.timeoutFn ?? ((ms) => AbortSignal.timeout(ms));
   const delayPlayin = opts.delayPlayinMs ?? 3000;
   const delayShop = Math.max(SHOP_DELAY_MS, opts.delayShopMs ?? opts.delayPlayinMs ?? SHOP_DELAY_MS);
   const log = opts.log ?? (() => {});
@@ -158,6 +240,20 @@ export async function lireLot(items, opts = {}) {
   let playinStop = null;
   const headers = { "user-agent": USER_AGENT, "accept-language": "fr-FR,fr;q=0.9", accept: "text/html,application/xhtml+xml" };
 
+  const reliquat = () => reliquatLecture(now(), t0, budget, reserve);
+  const peutReseau = (besoin = FETCH_MARGIN_MS) => reliquat() >= besoin;
+  const peutLireFiche = (delay) => reliquat() >= delay + FETCH_MARGIN_MS;
+  const signalBorne = (maxMs) => {
+    const ms = Math.min(maxMs, reliquat());
+    if (ms <= 0) return null;
+    return timeoutFn(ms);
+  };
+  const sleepBorne = async (ms) => {
+    const cap = reliquat();
+    if (cap <= 0 || ms <= 0) return;
+    await sleep(Math.min(ms, cap));
+  };
+
   const { map, order } = groupByShop(items);
 
   for (const shop of order) {
@@ -167,16 +263,31 @@ export async function lireLot(items, opts = {}) {
     let groups = null;
     let stop = null;
 
+    // Il faut de quoi lire au moins une fiche après un robots.txt rapide.
+    if (!peutLireFiche(delay) || !peutReseau()) {
+      n.temps += group.length;
+      continue;
+    }
+
     try {
-      const r = await withRetry(() => fetchImpl(`${origin}/robots.txt`, { headers, redirect: "follow", signal: AbortSignal.timeout(15_000) }), {
-        canRetry: () => now() - t0 < budget,
-        onRetry: retryLog("robots.txt"),
-      });
-      const txt = await r.text();
-      const raison = raisonArrets(shop, r.status, r.headers, txt);
-      if (raison) stop = raison;
-      else if (!r.ok) stop = "robots";
-      else groups = parseRobots(txt, new URL(origin).host);
+      const got = await withRetry(
+        () => {
+          const signal = signalBorne(ROBOTS_TIMEOUT_MS);
+          if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+          return fetchManuel(fetchImpl, `${origin}/robots.txt`, { headers, signal, shop });
+        },
+        { canRetry: () => peutReseau(), sleepImpl: sleepBorne, onRetry: retryLog("robots.txt") },
+      );
+      if (got?.interdit) {
+        stop = "robots";
+      } else {
+        const r = got;
+        const txt = await r.text();
+        const raison = raisonArrets(shop, r.status, r.headers, txt);
+        if (raison) stop = raison;
+        else if (!r.ok) stop = "robots";
+        else groups = parseRobots(txt, new URL(origin).host);
+      }
     } catch {
       stop = "robots";
     }
@@ -193,7 +304,7 @@ export async function lireLot(items, opts = {}) {
     }
 
     for (const it of group) {
-      if (now() - t0 > budget) {
+      if (!peutLireFiche(delay)) {
         n.temps += 1;
         continue;
       }
@@ -203,18 +314,30 @@ export async function lireLot(items, opts = {}) {
         releves.push(buildReleve(it, { erreur: "robots" }));
         continue;
       }
-      await sleep(delay);
+      await sleepBorne(delay);
+      if (!peutReseau()) {
+        n.temps += 1;
+        continue;
+      }
       n.lus += 1;
       let res;
       let html = "";
       try {
         ({ res, html } = await withRetry(
           async () => {
-            const r = await fetchImpl(it.url, { headers, redirect: "follow", signal: AbortSignal.timeout(20_000) });
-            return { res: r, html: await r.text() };
+            const signal = signalBorne(PAGE_TIMEOUT_MS);
+            if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+            const got = await fetchManuel(fetchImpl, it.url, { headers, signal, shop });
+            if (got?.interdit) return { res: null, html: "", interdit: true };
+            return { res: got, html: await got.text() };
           },
-          { canRetry: () => now() - t0 < budget, onRetry: retryLog("fiche") },
+          { canRetry: () => peutReseau(), sleepImpl: sleepBorne, onRetry: retryLog("fiche") },
         ));
+        if (res == null) {
+          n.http += 1;
+          releves.push(buildReleve(it, { erreur: "http_autre" }));
+          continue;
+        }
       } catch {
         n.reseau += 1;
         releves.push(buildReleve(it, { erreur: "reseau" }));

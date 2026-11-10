@@ -9,7 +9,7 @@
 //     envoie les alertes ; ce dépôt n'envoie rien.
 // Journal : compteurs seulement (pas d'identifiant de produit, pas de prix, pas d'URL).
 import { withRetry } from "./retry.mjs";
-import { lotPath, runPassage } from "./passage.mjs";
+import { lotPath, runPassage, POST_RESERVE_MS } from "./passage.mjs";
 
 const ORIGIN = "https://cotlyx.fr";
 const AUDIENCE = "https://cotlyx.fr/restock";
@@ -36,7 +36,7 @@ async function oidcToken() {
 // Appel à Cotlyx avec 2 nouvelles tentatives (délai dépassé, réseau, 5xx, 429). Le 16:35 du
 // 09/10 a échoué sur un délai dépassé ici. Un nouvel envoi des relevés est sans risque : Cotlyx
 // répond 409 « déjà rendu » s'il a reçu le premier ; après une nouvelle tentative, 409 = reçu.
-async function cotlyx(path, init = {}) {
+async function cotlyx(path, init = {}, timeoutMs = 20_000) {
   const token = await oidcToken();
   let essais = 0;
   const res = await withRetry(
@@ -45,7 +45,7 @@ async function cotlyx(path, init = {}) {
       return fetch(`${ORIGIN}${path}`, {
         ...init,
         headers: { ...(init.headers ?? {}), authorization: `Bearer ${token}`, "user-agent": CLIENT_UA, accept: "application/json" },
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     },
     { retryStatus: true, onRetry: retryLog(path) },
@@ -56,7 +56,7 @@ async function cotlyx(path, init = {}) {
 async function main() {
   return runPassage({
     getLot: () => cotlyx(lotPath()),
-    postReleves: (body) => cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    postReleves: (body) => cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, POST_RESERVE_MS),
     sleep,
     log,
     run: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null },
