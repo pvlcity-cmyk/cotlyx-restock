@@ -20,11 +20,15 @@ import { withRetry } from "./retry.mjs";
 import { ULTRAJEUX_ORIGIN, isUltrajeuxProductUrl, readUltrajeux } from "./ultrajeux.mjs";
 import { JSONLD_SHOPS, isJsonLdShopProductUrl, readJsonLdShop } from "./jsonld-shop.mjs";
 import { buildReleve } from "./releve.mjs";
+import { PUBLIC_LOT_SHOPS } from "./shops.mjs";
 
 export { buildReleve, buildRelevesBody } from "./releve.mjs";
+export { PUBLIC_LOT_SHOPS } from "./shops.mjs";
 
 /** Délai plancher entre deux fiches d'une même enseigne hors Play-In (4 s, ticket). */
 export const SHOP_DELAY_MS = 4000;
+
+const PUBLIC_LOT_SET = new Set(PUBLIC_LOT_SHOPS);
 
 export const SHOP_ORIGINS = {
   playin: PLAYIN_ORIGIN,
@@ -35,10 +39,10 @@ export const SHOP_ORIGINS = {
 const JSONLD_NAMES = new Set(Object.keys(JSONLD_SHOPS));
 
 export function isKnownShop(shop) {
-  return shop === "playin" || shop === "ultrajeux" || JSONLD_NAMES.has(shop);
+  return PUBLIC_LOT_SET.has(shop);
 }
 
-/** shop absent ou vide → playin (contrat actuel du GET /api/restock/lot). */
+/** shop absent ou vide → playin (contrat : sans shop, c'est Play-In). */
 export function shopOf(item) {
   const s = typeof item?.shop === "string" ? item.shop.trim().toLowerCase() : "";
   if (!s) return "playin";
@@ -52,23 +56,30 @@ export function isProductUrl(shop, url) {
   return false;
 }
 
-/** Identifiant de fiche : chiffres, 1 à 20 (EAN / id Shopify inclus). Play-In reste sur 1–12. */
-export function isItemId(id) {
-  return /^\d{1,20}$/.test(String(id));
+/** Identifiant de fiche : 1 à 20 chiffres, toujours une chaîne (zéros de tête conservés). */
+export function idChaine(raw) {
+  if (typeof raw === "string" && /^\d{1,20}$/.test(raw)) return raw;
+  if (typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0) {
+    const s = String(raw);
+    return /^\d{1,20}$/.test(s) ? s : null;
+  }
+  return null;
 }
 
 /**
- * Filtre et normalise les items du lot. Les enseignes inconnues, LGR, Vinticards
- * et les URL hors motif sont écartées, comme aujourd'hui pour une URL non Play-In.
+ * Filtre et normalise les items du lot. Les enseignes hors liste blanche, LGR, Vinticards
+ * et les URL hors motif sont écartées. L'id reste une chaîne, zéros de tête inclus.
  */
 export function preparerItems(raw, max = 40) {
   const out = [];
   for (const x of Array.isArray(raw) ? raw : []) {
-    if (!x || !isItemId(x.id)) continue;
+    if (!x) continue;
+    const id = idChaine(x.id);
+    if (!id) continue;
     const shop = shopOf(x);
     if (!shop) continue;
     if (!isProductUrl(shop, x.url)) continue;
-    out.push({ id: String(x.id), url: x.url, shop });
+    out.push({ id, url: x.url, shop });
     if (out.length >= max) break;
   }
   return out;
@@ -85,6 +96,12 @@ export function shopChallenge(shop, status, headers, html) {
   if (shop === "gentlemen" && status === 503) return "http";
   if (status === 503) return detectChallenge(200, headers, html);
   return detectChallenge(status, headers, html);
+}
+
+/** Valeur autorisée dans `arrets` : "defi" ou "503". Jamais "robots". */
+export function raisonArrets(shop, status, headers, html) {
+  if (!shopChallenge(shop, status, headers, html)) return null;
+  return shop === "gentlemen" && status === 503 ? "503" : "defi";
 }
 
 function readPage(shop, html) {
@@ -138,6 +155,7 @@ export async function lireLot(items, opts = {}) {
   const n = { lus: 0, ok: 0, disparues: 0, reseau: 0, http: 0, robots: 0, jsonld: 0, defi: 0, temps: 0 };
   const releves = [];
   const arrets = {};
+  let playinStop = null;
   const headers = { "user-agent": USER_AGENT, "accept-language": "fr-FR,fr;q=0.9", accept: "text/html,application/xhtml+xml" };
 
   const { map, order } = groupByShop(items);
@@ -155,7 +173,8 @@ export async function lireLot(items, opts = {}) {
         onRetry: retryLog("robots.txt"),
       });
       const txt = await r.text();
-      if (shopChallenge(shop, r.status, r.headers, txt)) stop = "defi";
+      const raison = raisonArrets(shop, r.status, r.headers, txt);
+      if (raison) stop = raison;
       else if (!r.ok) stop = "robots";
       else groups = parseRobots(txt, new URL(origin).host);
     } catch {
@@ -163,8 +182,13 @@ export async function lireLot(items, opts = {}) {
     }
 
     if (stop) {
-      arrets[shop] = stop;
-      if (stop === "defi") n.defi += 1;
+      // `arrets` n'accepte que defi | 503. Un échec robots n'y figure pas
+      // (Play-In : champ historique `arret` seulement).
+      if (stop === "defi" || stop === "503") {
+        arrets[shop] = stop;
+        n.defi += 1;
+      }
+      if (shop === "playin") playinStop = stop === "503" ? "defi" : stop;
       continue;
     }
 
@@ -196,11 +220,12 @@ export async function lireLot(items, opts = {}) {
         releves.push(buildReleve(it, { erreur: "reseau" }));
         continue;
       }
-      const ch = shopChallenge(shop, res.status, res.headers, html);
-      if (ch) {
+      const raison = raisonArrets(shop, res.status, res.headers, html);
+      if (raison) {
         n.defi += 1;
-        stop = "defi";
-        arrets[shop] = "defi";
+        stop = raison;
+        arrets[shop] = raison;
+        if (shop === "playin") playinStop = "defi";
         releves.push(buildReleve(it, { erreur: "defi" }));
         break;
       }
@@ -230,5 +255,5 @@ export async function lireLot(items, opts = {}) {
     }
   }
 
-  return { releves, n, arret: arrets.playin ?? null, arrets };
+  return { releves, n, arret: playinStop, arrets };
 }

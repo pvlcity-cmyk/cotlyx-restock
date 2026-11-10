@@ -1,10 +1,17 @@
 // Construction du relevé et du corps POST /api/restock/releves.
-// Isolée pour s'aligner sur le contrat de pvlcity-cmyk/estim #328 quand il sera figé.
-// Forme actuelle (Play-In) : { lot, run, arret, duree_ms, releves }.
-// Chaque relevé : { id, etat, prix, vendeur, entrepot, image, gtin }
-//   ou { id, erreur } ou { id, disparue: true }.
-// Champs ajoutés seulement quand ils n'affectent pas un lot Play-In seul :
-//   shop sur un relevé hors Play-In ; arrets (carte par enseigne) s'il y a un arrêt hors Play-In.
+// Contrat pvlcity-cmyk/estim #328 (tête 2a2ed7ea) :
+//   { lot, run?, arret, duree_ms, arrets?: { "<shop>": "defi"|"503" }, releves }
+//   arret : Play-In seulement (null | "defi" | "robots").
+//   arrets : uniquement "defi" ou "503" — jamais "robots".
+//   relevé : { id, shop?, etat, prix, vendeur, entrepot, image, gtin }
+//          ou { id, shop, erreur } ou { id, shop, disparue: true }.
+//   Sans shop, c'est Play-In. id : chaîne, zéros de tête conservés.
+
+import { PUBLIC_LOT_SHOPS } from "./shops.mjs";
+
+const SHOP_SET = new Set(PUBLIC_LOT_SHOPS);
+const ARRETS_OK = new Set(["defi", "503"]);
+const ARRET_OK = new Set(["defi", "robots"]);
 
 /** Relevé d'une fiche. `payload` : succès, { erreur }, ou { disparue: true }. */
 export function buildReleve(item, payload) {
@@ -13,22 +20,32 @@ export function buildReleve(item, payload) {
   return releve;
 }
 
+function filtrerArrets(arrets) {
+  const map = arrets && typeof arrets === "object" && !Array.isArray(arrets) ? arrets : {};
+  const out = {};
+  for (const [key, value] of Object.entries(map)) {
+    const shop = String(key).trim().toLowerCase();
+    const reason = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (!SHOP_SET.has(shop) || !ARRETS_OK.has(reason)) continue;
+    out[shop] = reason;
+  }
+  return out;
+}
+
 /**
  * Corps envoyé à POST /api/restock/releves.
- * `arret` : arrêt de Play-In uniquement (null | "defi" | "robots"), pour ne pas
- * geler Play-In si une autre enseigne rencontre un défi.
- * `arrets` : { [shop]: "defi" | "robots" } pour toutes les enseignes arrêtées.
+ * `arret` : arrêt de Play-In uniquement (null | "defi" | "robots").
+ * `arrets` : { [shop]: "defi" | "503" }, omis s'il est vide.
  */
 export function buildRelevesBody({ lot, run, arret, arrets, duree_ms, releves }) {
   const body = {
     lot: typeof lot === "string" ? lot.slice(0, 64) : null,
     run: run ?? { id: null, attempt: null },
-    arret: arret ?? null,
+    arret: ARRET_OK.has(arret) ? arret : null,
     duree_ms,
     releves,
   };
-  const map = arrets && typeof arrets === "object" ? arrets : {};
-  const horsPlayin = Object.keys(map).some((s) => s !== "playin");
-  if (horsPlayin) body.arrets = map;
+  const map = filtrerArrets(arrets);
+  if (Object.keys(map).length) body.arrets = map;
   return body;
 }

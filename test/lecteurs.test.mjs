@@ -14,8 +14,11 @@ import {
   shopChallenge,
   lireLot,
   SHOP_DELAY_MS,
+  PUBLIC_LOT_SHOPS,
+  idChaine,
 } from "../checker/dispatch.mjs";
 import { readProduct, detectChallenge } from "../checker/playin.mjs";
+import { lotPath, LOT_SHOPS_QUERY, runPassage, délaisDuLot, budgetDuLot } from "../checker/passage.mjs";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const fx = (name) => readFileSync(join(dir, "fixtures", name), "utf8");
@@ -250,7 +253,7 @@ test("503 Gentlemen : arrêt au premier, les autres enseignes continuent", async
     { fetchImpl, sleep: clk.sleep, now: clk.now, t0: clk.now(), delayPlayinMs: 3000, budgetMs: 120_000 },
   );
   assert.equal(arret, null);
-  assert.equal(arrets.gentlemen, "defi");
+  assert.equal(arrets.gentlemen, "503");
   const byId = Object.fromEntries(releves.map((r) => [r.id, r]));
   assert.equal(byId["13030"].erreur, "defi");
   assert.ok(!byId["13031"]);
@@ -304,13 +307,14 @@ test("délai respecté : horloge simulée, 3 s Play-In, 4 s autre enseigne", asy
   assert.equal(SHOP_DELAY_MS, 4000);
 });
 
-test("corps du relevé : forme Play-In inchangée ; shop et arrets seulement hors Play-In", () => {
+test("corps du relevé : sans shop = Play-In ; arrets seulement defi ou 503", () => {
   const playin = buildReleve({ id: "123456", shop: "playin" }, { etat: "in_stock", prix: 49.99, vendeur: true, entrepot: "STOCK_IN_WAREHOUSE", image: null, gtin: "0820650850011" });
   assert.deepEqual(playin, { id: "123456", etat: "in_stock", prix: 49.99, vendeur: true, entrepot: "STOCK_IN_WAREHOUSE", image: null, gtin: "0820650850011" });
   const uj = buildReleve({ id: "33282", shop: "ultrajeux" }, { etat: "in_stock", prix: 94.9, vendeur: true, entrepot: null, image: null, gtin: "0196214145221" });
   assert.equal(uj.shop, "ultrajeux");
   const onlyPlayin = buildRelevesBody({ lot: "lot-abc-12345678", run: { id: "1", attempt: "1" }, arret: "defi", arrets: { playin: "defi" }, duree_ms: 12, releves: [playin] });
-  assert.deepEqual(Object.keys(onlyPlayin), ["lot", "run", "arret", "duree_ms", "releves"]);
+  assert.equal(onlyPlayin.arret, "defi");
+  assert.deepEqual(onlyPlayin.arrets, { playin: "defi" });
   const mixed = buildRelevesBody({ lot: "lot-abc-12345678", run: { id: "1", attempt: "1" }, arret: null, arrets: { ultrajeux: "defi" }, duree_ms: 12, releves: [uj] });
   assert.deepEqual(mixed.arrets, { ultrajeux: "defi" });
   assert.equal(mixed.arret, null);
@@ -329,7 +333,112 @@ test("robots.txt illisible : enseigne sautée (arret robots), les autres continu
     ],
     { fetchImpl, sleep: clk.sleep, now: clk.now, t0: clk.now(), delayPlayinMs: 3000, budgetMs: 60_000 },
   );
-  assert.equal(arrets.ultrajeux, "robots");
+  assert.equal(arrets.ultrajeux, undefined, "robots n'entre pas dans arrets");
   assert.ok(!releves.some((r) => r.id === "33282"));
   assert.equal(releves.find((r) => r.id === "39598").etat, "in_stock");
+});
+
+
+/* ---------- contrat #328 ---------- */
+
+test("shops dans l'URL du GET /api/restock/lot", async () => {
+  assert.deepEqual(PUBLIC_LOT_SHOPS, ["playin", "ultrajeux", "smartoys", "bcd", "pokemael", "tzp", "gentlemen"]);
+  assert.equal(LOT_SHOPS_QUERY, "playin,ultrajeux,smartoys,bcd,pokemael,tzp,gentlemen");
+  assert.equal(lotPath(), "/api/restock/lot?shops=playin,ultrajeux,smartoys,bcd,pokemael,tzp,gentlemen");
+  const paths = [];
+  const code = await runPassage({
+    getLot: async (path) => {
+      paths.push(path);
+      return new Response(null, { status: 204 });
+    },
+    postReleves: async () => {
+      throw new Error("POST ne doit pas être appelé");
+    },
+    sleep: async () => {},
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(paths, [lotPath()]);
+});
+
+test("204 : aucun POST, sortie propre", async () => {
+  const posts = [];
+  const logs = [];
+  const code = await runPassage({
+    getLot: async () => new Response(null, { status: 204 }),
+    postReleves: async (body) => {
+      posts.push(body);
+      return new Response("{}", { status: 200 });
+    },
+    sleep: async () => {},
+    log: (m) => logs.push(m),
+  });
+  assert.equal(code, 0);
+  assert.equal(posts.length, 0);
+  assert.ok(logs.some((m) => /rien à lire/.test(m)));
+});
+
+test("id en chaîne avec zéros en tête", async () => {
+  assert.equal(idChaine("0196214145221"), "0196214145221");
+  assert.equal(typeof idChaine("0196214145221"), "string");
+  const items = preparerItems([{ id: "0196214145221", url: URLS.smartoys, shop: "smartoys" }]);
+  assert.equal(items[0].id, "0196214145221");
+  const { fetchImpl } = fakeFetch({ [URLS.smartoys]: { body: SM_NOPRICE } });
+  const clk = clock();
+  const { releves } = await lireLot(items, {
+    fetchImpl,
+    sleep: clk.sleep,
+    now: clk.now,
+    t0: clk.now(),
+    delayPlayinMs: 3000,
+    budgetMs: 60_000,
+  });
+  assert.equal(releves.length, 1);
+  assert.equal(releves[0].id, "0196214145221");
+  assert.equal(typeof releves[0].id, "string");
+  assert.equal(releves[0].shop, "smartoys");
+  const body = buildRelevesBody({ lot: "lot-zeros-12345678", run: { id: "1", attempt: "1" }, arret: null, arrets: {}, duree_ms: 1, releves });
+  assert.equal(body.releves[0].id, "0196214145221");
+  assert.ok(JSON.stringify(body).includes('"id":"0196214145221"'));
+});
+
+test("arrets sans robots", async () => {
+  const body = buildRelevesBody({
+    lot: "lot-abc-12345678",
+    run: { id: "1", attempt: "1" },
+    arret: "robots",
+    arrets: { playin: "robots", ultrajeux: "robots", gentlemen: "503", bcd: "defi", inconnue: "defi" },
+    duree_ms: 12,
+    releves: [],
+  });
+  assert.equal(body.arret, "robots");
+  assert.deepEqual(body.arrets, { gentlemen: "503", bcd: "defi" });
+  assert.ok(!Object.values(body.arrets).includes("robots"));
+  assert.ok(!Object.keys(body.arrets).includes("inconnue"));
+
+  const { fetchImpl } = fakeFetch({ [URLS.playin]: { body: playinPage() } }, { statusOf: { "https://www.play-in.com/robots.txt": 500 } });
+  const clk = clock();
+  const r = await lireLot([{ id: "123456", url: URLS.playin, shop: "playin" }], {
+    fetchImpl,
+    sleep: clk.sleep,
+    now: clk.now,
+    t0: clk.now(),
+    delayPlayinMs: 3000,
+    budgetMs: 60_000,
+  });
+  assert.equal(r.arret, "robots");
+  assert.equal(r.arrets.playin, undefined);
+  const posted = buildRelevesBody({ lot: "lot-abc-12345678", run: { id: "1", attempt: "1" }, arret: r.arret, arrets: r.arrets, duree_ms: 1, releves: r.releves });
+  assert.equal(posted.arret, "robots");
+  assert.equal(posted.arrets, undefined);
+});
+
+test("delayMs et budgetMs respectés, sans descendre sous 3 à 4 s", () => {
+  assert.deepEqual(délaisDuLot({ delayMs: 1000 }), { delayPlayinMs: 3000, delayShopMs: 4000 });
+  assert.deepEqual(délaisDuLot({ delayMs: 3000 }), { delayPlayinMs: 3000, delayShopMs: 4000 });
+  assert.deepEqual(délaisDuLot({ delayMs: 5000 }), { delayPlayinMs: 5000, delayShopMs: 5000 });
+  assert.deepEqual(délaisDuLot({}), { delayPlayinMs: 3000, delayShopMs: 4000 });
+  assert.equal(budgetDuLot({ budgetMs: 200_000 }), 200_000);
+  assert.equal(budgetDuLot({ budgetMs: 10_000 }), 10_000);
+  assert.equal(budgetDuLot({}), 200_000);
+  assert.equal(budgetDuLot({ budgetMs: 999_999 }), 240_000);
 });

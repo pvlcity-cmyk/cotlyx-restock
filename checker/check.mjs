@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Relevé des fiches suivies pour les alertes restock de Cotlyx.
-//  1. Demande à Cotlyx les fiches à lire (GET /api/restock/lot), authentifié par le jeton
+//  1. Demande à Cotlyx les fiches à lire (GET /api/restock/lot?shops=…), authentifié par le jeton
 //     OIDC de GitHub Actions : aucun secret dans ce dépôt.
 //  2. Lit les fiches poliment, enseigne par enseigne : robots.txt, User-Agent identifiable,
 //     pause entre deux requêtes de la même enseigne, arrêt au premier signe de blocage
@@ -8,15 +8,12 @@
 //  3. Renvoie l'état utile de chaque fiche (POST /api/restock/releves). Cotlyx décide et
 //     envoie les alertes ; ce dépôt n'envoie rien.
 // Journal : compteurs seulement (pas d'identifiant de produit, pas de prix, pas d'URL).
-// GET /api/restock/lot : pas de shops= pour l'instant (ajouté seulement après le merge du contrat).
 import { withRetry } from "./retry.mjs";
-import { preparerItems, lireLot, buildRelevesBody } from "./dispatch.mjs";
+import { lotPath, runPassage } from "./passage.mjs";
 
 const ORIGIN = "https://cotlyx.fr";
 const AUDIENCE = "https://cotlyx.fr/restock";
 const CLIENT_UA = "CotlyxRestock/1.0 (+https://github.com/pvlcity-cmyk/cotlyx-restock)";
-const DELAY_MIN_MS = 1500;
-const BUDGET_MAX_MS = 240_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.log(`[restock] ${m}`);
@@ -57,46 +54,13 @@ async function cotlyx(path, init = {}) {
 }
 
 async function main() {
-  const t0 = Date.now();
-  const lotRes = await cotlyx("/api/restock/lot");
-  if (lotRes.status === 204) {
-    log("rien à lire pour ce créneau");
-    return 0;
-  }
-  if (!lotRes.ok) {
-    log(`lot indisponible (HTTP ${lotRes.status})`);
-    return lotRes.status === 409 ? 0 : 1;
-  }
-  const lot = await lotRes.json().catch(() => null);
-  const items = preparerItems(lot?.items);
-  const delay = Math.max(DELAY_MIN_MS, Number(lot?.delayMs) || 3000);
-  const budget = Math.min(BUDGET_MAX_MS, Number(lot?.budgetMs) || 150_000);
-  if (!items.length) {
-    log("lot vide");
-    return 0;
-  }
-
-  const { releves, n, arret, arrets } = await lireLot(items, {
-    delayPlayinMs: delay,
-    budgetMs: budget,
-    t0,
+  return runPassage({
+    getLot: () => cotlyx(lotPath()),
+    postReleves: (body) => cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
     sleep,
     log,
-  });
-
-  const duree = Date.now() - t0;
-  const body = buildRelevesBody({
-    lot: typeof lot?.lot === "string" ? lot.lot.slice(0, 64) : null,
     run: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null },
-    arret,
-    arrets,
-    duree_ms: duree,
-    releves,
   });
-  const post = await cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  const recu = post.ok || (post.status === 409 && post.essais > 1);
-  log(`bilan ${JSON.stringify({ demandees: items.length, ...n, arret, duree_s: Math.round(duree / 100) / 10, envoi: post.status, essais: post.essais })}`);
-  return recu ? 0 : 1;
 }
 
 main()
