@@ -80,13 +80,22 @@ function finaliserReponse(res, url, redirected) {
 /**
  * GET avec redirect:manual. On ne suit une redirection que si l'hôte d'arrivée
  * est autorisé pour l'enseigne, https, au plus MAX_REDIRECTS sauts.
+ * Chaque saut autorisé passe par `avantSaut` (cadence par enseigne, échéance
+ * absolue, réserve de budget) quand il est fourni. Si l'attente dépasse
+ * l'échéance, on abandonne sans lancer la requête suivante.
  * Sinon { interdit: true } → relevé http_autre (page) ou échec robots.
  */
-export async function fetchManuel(fetchImpl, url, { headers, signal, shop }) {
+export async function fetchManuel(fetchImpl, url, { headers, signal, shop, avantSaut } = {}) {
   let current = url;
   let redirected = false;
+  let currentSignal = signal;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const res = await fetchImpl(current, { headers, redirect: "manual", signal });
+    if (hop > 0 && typeof avantSaut === "function") {
+      const nextSignal = await avantSaut();
+      if (!nextSignal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
+      currentSignal = nextSignal;
+    }
+    const res = await fetchImpl(current, { headers, redirect: "manual", signal: currentSignal });
     if (!estRedirection(res.status)) return finaliserReponse(res, current, redirected);
     const loc = res.headers.get("location");
     if (!loc || hop === MAX_REDIRECTS) return { interdit: true };
@@ -291,16 +300,28 @@ export async function lireLot(items, opts = {}) {
       return lectureDeadline - (now() + wait) >= delay + FETCH_MARGIN_MS;
     };
     const canAttemptShop = () => peutLireFiche(delay) && peutReseau() && reliquatTotal() > 0;
+    const budgetTimeout = () => Object.assign(new Error("budget"), { name: "TimeoutError" });
+    /** Même attente, échéance et réserve pour la requête initiale et chaque saut. */
+    const demarrerRequete = async (maxMs) => {
+      if (!(await attendreCadence(shop, delay))) return null;
+      if (!canAttemptShop()) return null;
+      const signal = signalBorne(maxMs);
+      if (!signal) return null;
+      lastStart.set(shop, now());
+      return signal;
+    };
 
     try {
       const got = await withRetry(
         async () => {
-          if (!(await attendreCadence(shop, delay))) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-          if (!canAttemptShop()) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-          const signal = signalBorne(ROBOTS_TIMEOUT_MS);
-          if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-          lastStart.set(shop, now());
-          return fetchManuel(fetchImpl, `${origin}/robots.txt`, { headers, signal, shop });
+          const signal = await demarrerRequete(ROBOTS_TIMEOUT_MS);
+          if (!signal) throw budgetTimeout();
+          return fetchManuel(fetchImpl, `${origin}/robots.txt`, {
+            headers,
+            signal,
+            shop,
+            avantSaut: () => demarrerRequete(ROBOTS_TIMEOUT_MS),
+          });
         },
         {
           backoffMs: (i) => backoffCadence(shop, delay, i),
@@ -358,12 +379,14 @@ export async function lireLot(items, opts = {}) {
       try {
         ({ res, html } = await withRetry(
           async () => {
-            if (!(await attendreCadence(shop, delay))) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-            if (!canAttemptShop()) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-            const signal = signalBorne(PAGE_TIMEOUT_MS);
-            if (!signal) throw Object.assign(new Error("budget"), { name: "TimeoutError" });
-            lastStart.set(shop, now());
-            const got = await fetchManuel(fetchImpl, it.url, { headers, signal, shop });
+            const signal = await demarrerRequete(PAGE_TIMEOUT_MS);
+            if (!signal) throw budgetTimeout();
+            const got = await fetchManuel(fetchImpl, it.url, {
+              headers,
+              signal,
+              shop,
+              avantSaut: () => demarrerRequete(PAGE_TIMEOUT_MS),
+            });
             if (got?.interdit) return { res: null, html: "", interdit: true };
             return { res: got, html: await got.text() };
           },

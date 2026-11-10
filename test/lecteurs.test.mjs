@@ -814,3 +814,83 @@ test("cadence par enseigne : retries compris, 4 s hors Play-In et 3 s Play-In (c
   await cadence("ultrajeux", URLS.ultrajeux, 4_000, UJ_IN);
   await cadence("playin", URLS.playin, 3_000, playinPage());
 });
+
+test("cadence : une redirection autorisée attend 4 s Ultrajeux et 3 s Play-In (cas Data)", async () => {
+  // Repro Data : robots à 0, page à 4000, cible redirigée aussi à 4000 (0 ms d'écart).
+  // Attendu : chaque requête suivie après redirection attend la cadence de l'enseigne.
+  const BUDGET = BUDGET_MAX_MS;
+  const chaine = async (shop, url, delay, body) => {
+    const clk = horloge(0);
+    const calls = [];
+    const timeoutFn = () => new AbortController().signal;
+    const fetchImpl = async (input, init) => {
+      const u = String(input);
+      calls.push({ url: u, at: clk.now(), redirect: init?.redirect });
+      if (u.endsWith("/robots.txt")) return new Response("User-agent: *\nAllow: /\n");
+      if (u === url) return new Response(null, { status: 302, headers: { location: "/redirected" } });
+      return new Response(body, { status: 200 });
+    };
+    await lireLot([{ id: shop === "playin" ? "123456" : "33282", url, shop }], {
+      fetchImpl,
+      sleep: clk.sleep,
+      now: clk.now,
+      t0: 0,
+      deadline: BUDGET,
+      budgetMs: BUDGET,
+      delayPlayinMs: 3000,
+      timeoutFn,
+    });
+    assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+    assert.ok(!calls.some((c) => c.at >= BUDGET), "aucun appel à l'échéance ou après");
+    assert.ok(calls.every((c) => c.redirect === "manual"));
+    assert.ok(calls.length >= 3, "robots + page + cible redirigée");
+    for (let i = 1; i < calls.length; i++) {
+      const gap = calls[i].at - calls[i - 1].at;
+      assert.ok(gap >= delay, `écart ${gap} ms < ${delay} ms (${shop})`);
+    }
+    const page = calls.find((c) => c.url === url);
+    const cible = calls.find((c) => /\/redirected$/.test(new URL(c.url, url).pathname) || c.url.endsWith("/redirected"));
+    assert.ok(page, "la page initiale a été appelée");
+    assert.ok(cible, "la cible redirigée a été suivie");
+    assert.ok(cible.at - page.at >= delay, `page→cible ${cible.at - page.at} ms < ${delay} ms (${shop})`);
+  };
+  await chaine("ultrajeux", URLS.ultrajeux, 4_000, UJ_IN);
+  await chaine("playin", URLS.playin, 3_000, playinPage());
+});
+
+test("cadence : si l'attente d'un saut dépasse l'échéance, la cible n'est pas appelée", async () => {
+  // robots à 221000, page à 225000 ; un saut à 229000 laisserait moins que politesse + 1 s
+  // avant la réserve POST (230000). On abandonne sans requête vers la cible.
+  const BUDGET = BUDGET_MAX_MS;
+  const clk = horloge(221_000);
+  const calls = [];
+  const timeoutFn = () => new AbortController().signal;
+  const url = URLS.ultrajeux;
+  const fetchImpl = async (input, init) => {
+    const u = String(input);
+    calls.push({ url: u, at: clk.now(), redirect: init?.redirect });
+    if (u.endsWith("/robots.txt")) return new Response("User-agent: *\nAllow: /\n");
+    if (u === url) return new Response(null, { status: 302, headers: { location: "/redirected" } });
+    return new Response(UJ_IN, { status: 200 });
+  };
+  const r = await lireLot([{ id: "33282", url, shop: "ultrajeux" }], {
+    fetchImpl,
+    sleep: clk.sleep,
+    now: clk.now,
+    t0: 0,
+    deadline: BUDGET,
+    budgetMs: BUDGET,
+    delayPlayinMs: 3000,
+    timeoutFn,
+  });
+  assert.ok(clk.t <= BUDGET, `fin à ${clk.t} ms`);
+  assert.ok(!calls.some((c) => c.at >= BUDGET), "aucun appel à l'échéance ou après");
+  assert.equal(calls.length, 2, "robots et page seulement");
+  assert.ok(calls[0].url.endsWith("/robots.txt"));
+  assert.equal(calls[0].at, 221_000);
+  assert.equal(calls[1].url, url);
+  assert.equal(calls[1].at, 225_000);
+  assert.ok(!calls.some((c) => c.url.includes("/redirected")), "cible non suivie une fois l'échéance trop proche");
+  assert.equal(r.releves.length, 1);
+  assert.equal(r.releves[0].erreur, "reseau");
+});
