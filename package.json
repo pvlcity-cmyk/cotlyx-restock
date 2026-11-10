@@ -2,7 +2,7 @@
   "name": "cotlyx-restock",
   "private": true,
   "type": "module",
-  "description": "Relevé de stock Play-in pour les alertes restock de Cotlyx",
+  "description": "Relevé de stock des fiches suivies pour les alertes restock de Cotlyx",
   "license": "MIT",
   "engines": { "node": ">=20" },
   "scripts": { "test": "node --test test/*.test.mjs" }

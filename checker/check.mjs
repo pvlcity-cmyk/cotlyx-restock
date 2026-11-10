@@ -1,19 +1,20 @@
 #!/usr/bin/env node
-// Relevé Play-in pour les alertes restock de Cotlyx.
+// Relevé des fiches suivies pour les alertes restock de Cotlyx.
 //  1. Demande à Cotlyx les fiches à lire (GET /api/restock/lot), authentifié par le jeton
 //     OIDC de GitHub Actions : aucun secret dans ce dépôt.
-//  2. Lit les fiches poliment : robots.txt, User-Agent identifiable, pause entre deux
-//     requêtes, arrêt au premier signe de blocage (aucun contournement).
+//  2. Lit les fiches poliment, enseigne par enseigne : robots.txt, User-Agent identifiable,
+//     pause entre deux requêtes de la même enseigne, arrêt au premier signe de blocage
+//     (aucun contournement). Play-In passe par playin.mjs, sans changement de comportement.
 //  3. Renvoie l'état utile de chaque fiche (POST /api/restock/releves). Cotlyx décide et
 //     envoie les alertes ; ce dépôt n'envoie rien.
 // Journal : compteurs seulement (pas d'identifiant de produit, pas de prix, pas d'URL).
-import { USER_AGENT, PLAYIN_ORIGIN, parseRobots, robotsAllows, detectChallenge, isPlayinProductUrl, redirectGone, readProduct, softGone } from "./playin.mjs";
+// GET /api/restock/lot : pas de shops= pour l'instant (ajouté seulement après le merge du contrat).
 import { withRetry } from "./retry.mjs";
+import { preparerItems, lireLot, buildRelevesBody } from "./dispatch.mjs";
 
 const ORIGIN = "https://cotlyx.fr";
 const AUDIENCE = "https://cotlyx.fr/restock";
 const CLIENT_UA = "CotlyxRestock/1.0 (+https://github.com/pvlcity-cmyk/cotlyx-restock)";
-const MAX_ITEMS = 40;
 const DELAY_MIN_MS = 1500;
 const BUDGET_MAX_MS = 240_000;
 
@@ -67,110 +68,34 @@ async function main() {
     return lotRes.status === 409 ? 0 : 1;
   }
   const lot = await lotRes.json().catch(() => null);
-  const items = (Array.isArray(lot?.items) ? lot.items : [])
-    .filter((x) => x && /^\d{1,12}$/.test(String(x.id)) && isPlayinProductUrl(x.url))
-    .slice(0, MAX_ITEMS);
+  const items = preparerItems(lot?.items);
   const delay = Math.max(DELAY_MIN_MS, Number(lot?.delayMs) || 3000);
   const budget = Math.min(BUDGET_MAX_MS, Number(lot?.budgetMs) || 150_000);
-  const n = { lus: 0, ok: 0, disparues: 0, reseau: 0, http: 0, robots: 0, jsonld: 0, defi: 0, temps: 0 };
-  const releves = [];
   if (!items.length) {
     log("lot vide");
     return 0;
   }
 
-  const headers = { "user-agent": USER_AGENT, "accept-language": "fr-FR,fr;q=0.9", accept: "text/html,application/xhtml+xml" };
-  let groups = null;
-  let stop = null;
-  try {
-    const r = await withRetry(() => fetch(`${PLAYIN_ORIGIN}/robots.txt`, { headers, redirect: "follow", signal: AbortSignal.timeout(15_000) }), {
-      canRetry: () => Date.now() - t0 < budget,
-      onRetry: retryLog("robots.txt"),
-    });
-    const txt = await r.text();
-    if (detectChallenge(r.status, r.headers, txt)) stop = "defi";
-    else if (!r.ok) stop = "robots";
-    else groups = parseRobots(txt);
-  } catch {
-    stop = "robots";
-  }
-
-  for (const it of items) {
-    if (stop) break;
-    if (Date.now() - t0 > budget) {
-      n.temps += 1;
-      continue;
-    }
-    const u = new URL(it.url);
-    if (!robotsAllows(groups, u.pathname + u.search)) {
-      n.robots += 1;
-      releves.push({ id: String(it.id), erreur: "robots" });
-      continue;
-    }
-    await sleep(delay);
-    n.lus += 1;
-    let res;
-    let html = "";
-    try {
-      // Délai dépassé ou réseau sur une fiche : 2 nouvelles tentatives (dans le budget), puis la
-      // fiche seule est notée « reseau » ; le passage continue. Pas de nouvelle tentative sur une
-      // réponse HTTP (blocage, 4xx, 5xx) : politesse envers Play-in.
-      ({ res, html } = await withRetry(
-        async () => {
-          const r = await fetch(it.url, { headers, redirect: "follow", signal: AbortSignal.timeout(20_000) });
-          return { res: r, html: await r.text() };
-        },
-        { canRetry: () => Date.now() - t0 < budget, onRetry: retryLog("fiche") },
-      ));
-    } catch {
-      n.reseau += 1;
-      releves.push({ id: String(it.id), erreur: "reseau" });
-      continue;
-    }
-    const ch = detectChallenge(res.status, res.headers, html);
-    if (ch) {
-      // Blocage ou défi : on arrête tout le passage, sans nouvelle tentative.
-      n.defi += 1;
-      stop = "defi";
-      releves.push({ id: String(it.id), erreur: "defi" });
-      break;
-    }
-    if (res.ok && redirectGone(it.id, res.redirected, res.url)) {
-      n.disparues += 1;
-      releves.push({ id: String(it.id), disparue: true });
-      continue;
-    }
-    if (!res.ok) {
-      n.http += 1;
-      releves.push({ id: String(it.id), erreur: `http_${res.status === 404 || res.status === 410 ? "absente" : "autre"}` });
-      continue;
-    }
-    const p = readProduct(html);
-    if (!p && softGone(html)) {
-      n.disparues += 1;
-      releves.push({ id: String(it.id), disparue: true });
-      continue;
-    }
-    if (!p) {
-      n.jsonld += 1;
-      releves.push({ id: String(it.id), erreur: "jsonld" });
-      continue;
-    }
-    n.ok += 1;
-    releves.push({ id: String(it.id), etat: p.etat, prix: p.prix, vendeur: p.vendeur, entrepot: p.entrepot, image: p.image, gtin: p.gtin });
-  }
+  const { releves, n, arret, arrets } = await lireLot(items, {
+    delayPlayinMs: delay,
+    budgetMs: budget,
+    t0,
+    sleep,
+    log,
+  });
 
   const duree = Date.now() - t0;
-  const body = {
+  const body = buildRelevesBody({
     lot: typeof lot?.lot === "string" ? lot.lot.slice(0, 64) : null,
     run: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null },
-    arret: stop,
+    arret,
+    arrets,
     duree_ms: duree,
     releves,
-  };
+  });
   const post = await cotlyx("/api/restock/releves", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const recu = post.ok || (post.status === 409 && post.essais > 1);
-  log(`bilan ${JSON.stringify({ demandees: items.length, ...n, arret: stop, duree_s: Math.round(duree / 100) / 10, envoi: post.status, essais: post.essais })}`);
+  log(`bilan ${JSON.stringify({ demandees: items.length, ...n, arret, duree_s: Math.round(duree / 100) / 10, envoi: post.status, essais: post.essais })}`);
   return recu ? 0 : 1;
 }
 
